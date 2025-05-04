@@ -7,7 +7,7 @@ import PackageDescription
 let sha1 = "0234fd8243d51b4c08b89b6ba8aada77f31cde34"
 let binaryFilename = "PartoutCore.xcframework.zip"
 let version = "0.99.110"
-let checksum = "30bf6a73908571241357ebc50a79e18b358028202f877f37a0397b89d33d5f32"
+let checksum = "7c0a0114305b1843276938405bbe2400b6011cbef3ebd268b4d8d8418c5fee26"
 
 enum Environment {
     case remoteBinary
