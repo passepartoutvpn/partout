@@ -209,7 +209,7 @@ private extension ContentView {
                     }
 
                 case .disconnect:
-                    try await vpn.disconnect()
+                    try await vpn.disconnect(from profileId: profile.id)
                 }
             } catch {
                 print("Unable to start VPN: \(error.localizedDescription)")
