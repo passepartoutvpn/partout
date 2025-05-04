@@ -346,7 +346,7 @@ private extension NETunnelStrategy {
     }
 
     func disconnectCurrentManagers() async {
-        await withTaskGroup { group in
+        await withTaskGroup(of: Void.self) { group in
             allManagers.forEach { pair in
                 let status = pair.value.connection.status.asTunnelStatus
                 guard status != .inactive || pair.value.isOnDemandEnabled == true else {
