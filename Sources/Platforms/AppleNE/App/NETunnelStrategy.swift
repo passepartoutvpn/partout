@@ -29,19 +29,23 @@ import PartoutCore
 
 /// Tunnel strategy based on `NETunnelProviderManager`.
 public actor NETunnelStrategy {
+    public enum Option {
+        case multiple
+    }
+
     private let bundleIdentifier: String
 
     private let coder: NEProtocolCoder
 
     private let environment: TunnelEnvironment
 
-    private nonisolated let managersSubject: CurrentValueStream<[Profile.ID: NETunnelProviderManager]>
+    private let options: Set<Option>
 
-    private nonisolated let currentManagerSubject: CurrentValueStream<NETunnelProviderManager?>
+    private nonisolated let managersSubject: CurrentValueStream<[Profile.ID: NETunnelProviderManager]>
 
     private var allManagers: [Profile.ID: NETunnelProviderManager] {
         didSet {
-            updateCurrentManager()
+            managersSubject.send(allManagers)
         }
     }
 
@@ -51,12 +55,15 @@ public actor NETunnelStrategy {
         bundleIdentifier: String,
         coder: NEProtocolCoder,
         environment: TunnelEnvironment
+//        options: Set<Option> = []
     ) {
         self.bundleIdentifier = bundleIdentifier
         self.coder = coder
         self.environment = environment
+        // FIXME: #passepartout/218, allow option after support in PTP
+//        self.options = options
+        options = []//[.multiple]
         managersSubject = CurrentValueStream([:])
-        currentManagerSubject = CurrentValueStream(nil)
         allManagers = [:]
 
         NotificationCenter.default.addObserver(
@@ -82,7 +89,7 @@ public actor NETunnelStrategy {
 
 extension NETunnelStrategy: TunnelObservableStrategy {
     public func prepare(purge: Bool) async throws {
-        try await reloadAllManagers(andPublish: true)
+        try await reloadAllManagers()
         if purge {
             await coder.purge(managers: Array(allManagers.values))
         }
@@ -95,23 +102,15 @@ extension NETunnelStrategy: TunnelObservableStrategy {
         title: @escaping (Profile) -> String
     ) async throws {
 
+        // FIXME: #passepartout/218, PTP must handle multiple startTunnel()/stopTunnel()
+        //
         // disconnect before connect to work around macOS bug
         // resulting in multiple calls to startTunnel() to then
         // call stopTunnel() after 5s with reason .superceded
         //
-        // TODO: #passepartout/218, do not disconnect active tunnel on macOS
-        // it's not a bug, it's the intended behavior (yet poorly documented)
-        // rework PTP to handle multiple calls to startTunnel()/stopTunnel() in
-        // the same process
-        if connect, let currentManager {
-            let status = currentManager.connection.status.asTunnelStatus
-            if status != .inactive || currentManager.isOnDemandEnabled == true {
-                pp_log(.ne, .notice, "Disconnect active connection...")
-                try await disconnect()
-                pp_log(.ne, .notice, "Disconnection complete!")
-            }
+        if connect, !self.options.contains(.multiple) {
+            await disconnectCurrentManagers()
         }
-
         try await save(profile, forConnecting: connect, options: options?.values, title: title)
     }
 
@@ -119,8 +118,8 @@ extension NETunnelStrategy: TunnelObservableStrategy {
         try await remove(profileId: profileId)
     }
 
-    public func disconnect() async throws {
-        guard let manager = currentManager else {
+    public func disconnect(from profileId: Profile.ID) async throws {
+        guard let manager = allManagers[profileId] else {
             return
         }
         try await saveAtomically(manager) {
@@ -130,8 +129,9 @@ extension NETunnelStrategy: TunnelObservableStrategy {
         await manager.connection.waitForDisconnection()
     }
 
-    public func sendMessage(_ message: Data) async throws -> Data? {
-        guard let manager = currentManager else {
+    public func sendMessage(_ message: Data, to profileId: Profile.ID) async throws -> Data? {
+        guard let manager = allManagers[profileId],
+              manager.connection.status.asTunnelStatus != .inactive else {
             return nil
         }
         try await manager.loadFromPreferences()
@@ -149,31 +149,20 @@ extension NETunnelStrategy: TunnelObservableStrategy {
         }
     }
 
-    public nonisolated var currentProfile: TunnelCurrentProfile? {
-        currentManager?.asCurrentProfile
-    }
-
-    public nonisolated var didSetCurrent: AsyncStream<TunnelCurrentProfile?> {
+    public nonisolated var didSetCurrent: AsyncStream<[Profile.ID: TunnelCurrentProfile]> {
         AsyncStream { [weak self] continuation in
             Task { [weak self] in
                 guard let self else {
                     continuation.finish()
                     return
                 }
-                let stream = currentManagerSubject.subscribe().dropFirst()
-                var previousValue: TunnelCurrentProfile?
-                for await manager in stream {
+                for await activeProfiles in activeProfilesStream.dropFirst() {
                     guard !Task.isCancelled else {
                         pp_log(.ne, .debug, "Cancelled NETunnelStrategy.didSetCurrent")
                         break
                     }
-                    let newValue = manager?.asCurrentProfile
-                    guard newValue != previousValue else {
-                        continue
-                    }
-                    pp_log(.ne, .debug, "NETunnelStrategy.currentProfile -> \(newValue.debugDescription)")
-                    continuation.yield(newValue)
-                    previousValue = newValue
+                    pp_log(.ne, .debug, "NETunnelStrategy.currentProfiles -> \(activeProfiles.debugDescription)")
+                    continuation.yield(activeProfiles)
                 }
                 continuation.finish()
             }
@@ -185,7 +174,7 @@ extension NETunnelStrategy: TunnelObservableStrategy {
 
 extension NETunnelStrategy: NETunnelManagerRepository {
     public func fetch() async throws -> [NETunnelProviderManager] {
-        try await reloadAllManagers(andPublish: false)
+        try await reloadAllManagers()
         let managers = Array(allManagers.values)
         await coder.purge(managers: managers)
         return managers
@@ -298,7 +287,7 @@ private extension NETunnelStrategy {
         pp_log(.ne, .debug, "NEVPNConfigurationChange(\(profileId)): \(notification)")
         Task {
             do {
-                try await reloadAllManagers(andPublish: true)
+                try await reloadAllManagers()
             } catch {
                 pp_log(.ne, .error, "Unable to reload managers: \(error)")
             }
@@ -317,7 +306,7 @@ private extension NETunnelStrategy {
 //        pp_log(.ne, .debug, "NEVPNStatusDidChange: \(notification)")
         pp_log(.ne, .debug, "NEVPNStatus(\(profileId)) -> \(connection.status.rawValue)")
         Task {
-            await updateCurrentManagerIfNeeded(with: manager, profileId: profileId)
+            await updateCurrentManagersIfNeeded(with: manager, profileId: profileId)
         }
     }
 }
@@ -355,21 +344,70 @@ private extension NETunnelStrategy {
         pendingSaveTask = nil
         return manager
     }
-}
 
-// MARK: - Current manager
-
-private extension NETunnelStrategy {
-    nonisolated var currentManager: NETunnelProviderManager? {
-        get {
-            currentManagerSubject.value
-        }
-        set {
-            currentManagerSubject.send(newValue)
+    func disconnectCurrentManagers() async {
+        await withTaskGroup(of: Void.self) { group in
+            allManagers.forEach { pair in
+                let status = pair.value.connection.status.asTunnelStatus
+                guard status != .inactive || pair.value.isOnDemandEnabled == true else {
+                    return
+                }
+                group.addTask {
+                    pp_log(.ne, .notice, "Disconnect from \(pair.key)...")
+                    do {
+                        try await self.disconnect(from: pair.key)
+                    } catch {
+                        pp_log(.ne, .error, "Unable to disconnect from \(pair.key): \(error)")
+                    }
+                    pp_log(.ne, .notice, "Disconnection of \(pair.key) complete!")
+                }
+            }
         }
     }
+}
 
-    func reloadAllManagers(andPublish: Bool) async throws {
+// MARK: - Current managers
+
+private extension NETunnelStrategy {
+    nonisolated var activeProfilesStream: AsyncStream<[Profile.ID: TunnelCurrentProfile]> {
+        let stream = managersSubject.subscribe()
+        let mappedStream: AsyncStream<[Profile.ID: TunnelCurrentProfile]>
+
+        if options.contains(.multiple) {
+            mappedStream = stream
+                .map {
+                    // active managers are those ranked > 0
+                    $0.filter {
+                        $0.value.rank > 0
+                    }
+                    .compactMapValues(\.asCurrentProfile)
+                }
+        } else {
+            mappedStream = stream
+                .map {
+                    // active manager is the max ranked
+                    let maxRank = $0.max {
+                        $0.value.rank < $1.value.rank
+                    }?.value.rank ?? 0
+
+                    // if max rank is 0, no manager is active
+                    guard maxRank > 0 else {
+                        return [:]
+                    }
+
+                    // return the max ranked manager
+                    let filtered = $0.filter {
+                        $0.value.rank == maxRank
+                    }
+                    assert(filtered.count <= 1, "Max ranked manager must be at most one")
+                    return filtered.compactMapValues(\.asCurrentProfile)
+                }
+        }
+
+        return mappedStream.removeDuplicates()
+    }
+
+    func reloadAllManagers() async throws {
         var removedManagers = allManagers
 
         let managers = try await NETunnelProviderManager.loadAllFromPreferences()
@@ -392,24 +430,9 @@ private extension NETunnelStrategy {
         }
 
         logManagers()
-        if andPublish {
-            managersSubject.send(allManagers)
-        }
     }
 
-    func updateCurrentManager() {
-        guard !allManagers.values.allSatisfy({ $0.rank == 0 }) else {
-            currentManager = nil
-            return
-        }
-        if let newManager = allManagers.values.max(by: { $0.rank < $1.rank }), newManager.rank > 0 {
-            currentManager = newManager
-        } else {
-            currentManager = nil
-        }
-    }
-
-    func updateCurrentManagerIfNeeded(with manager: NETunnelProviderManager, profileId: Profile.ID) {
+    func updateCurrentManagersIfNeeded(with manager: NETunnelProviderManager, profileId: Profile.ID) {
 
         // deletion
         if allManagers.keys.contains(profileId), manager.connection.status == .invalid {
@@ -438,8 +461,8 @@ private extension NETunnelStrategy {
 
 private extension NETunnelProviderManager {
     var rank: Int {
-#if os(iOS)
-        // only one profile at a time is enabled on iOS
+#if os(iOS) || os(tvOS)
+        // only one profile at a time is enabled on iOS/tvOS
         if isEnabled {
             return .max
         }
@@ -451,10 +474,6 @@ private extension NETunnelProviderManager {
             return 1
         }
         return 0
-    }
-
-    var isStopping: Bool {
-        [.disconnecting, .disconnected, .invalid].contains(connection.status)
     }
 }
 

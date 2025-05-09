@@ -209,7 +209,7 @@ private extension ContentView {
                     }
 
                 case .disconnect:
-                    try await vpn.disconnect()
+                    try await vpn.disconnect(from: profile.id)
                 }
             } catch {
                 print("Unable to start VPN: \(error.localizedDescription)")
@@ -247,7 +247,7 @@ private extension ContentView {
 
         message = .localLog(sinceLast: interval, maxLevel: Demo.Log.maxLevel)
 
-        guard let output = try await vpn.sendMessage(message) else {
+        guard let output = try await vpn.sendMessage(message, to: profile.id) else {
             return
         }
         guard case .debugLog(let log) = output else {
